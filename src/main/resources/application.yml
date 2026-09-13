@@ -1,0 +1,72 @@
+spring:
+  application:
+    name: ms-andesstay-audit
+  datasource:
+    url: ${DB_URL:jdbc:oracle:thin:@localhost:1521/FREEPDB1}
+    username: ${DB_USERNAME:andesstay}
+    password: ${DB_PASSWORD:changeit}
+    driver-class-name: oracle.jdbc.OracleDriver
+  jpa:
+    hibernate:
+      ddl-auto: ${JPA_DDL_AUTO:update}
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+    show-sql: ${JPA_SHOW_SQL:false}
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${AZURE_ISSUER_URI:https://login.microsoftonline.com/fbf645d5-8f6d-45fc-9e8d-c8866d008af1/v2.0}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: ms-andesstay-audit
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        # Spring Boot 4 usa Jackson 3 por defecto: JacksonJsonDeserializer/Serializer son
+        # las clases nativas de Jackson 3 (el JsonDeserializer/JsonSerializer clasico
+        # requiere Jackson 2 en el classpath, que ya no viene incluido).
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.trusted.packages: com.andesstay.ms_andesstay_audit.messaging
+        spring.json.value.default.type: com.andesstay.ms_andesstay_audit.messaging.ReservationEvent
+        spring.json.use.type.headers: false
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+    listener:
+      ack-mode: record
+
+server:
+  port: ${SERVER_PORT:8084}
+
+andesstay:
+  security:
+    audience: ${AZURE_API_AUDIENCE:api://d6959b0c-9ec2-432e-bddb-54bd0e83ace9}
+    roles-claim: roles
+  kafka:
+    topic-reservations-events: reservations.events
+    topic-audit-timeline: audit.timeline
+    partitions: 3
+    # 3 replicas es lo que pide el caso para el cluster de EC2 (seccion 9); en un Kafka
+    # de un solo broker en local esto debe bajarse a 1 via esta misma variable.
+    replication-factor: ${KAFKA_TOPIC_REPLICATION_FACTOR:1}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:
+    com.andesstay: INFO
