@@ -20,12 +20,24 @@ spring:
         jwt:
           issuer-uri: ${AZURE_ISSUER_URI:https://login.microsoftonline.com/fbf645d5-8f6d-45fc-9e8d-c8866d008af1/v2.0}
   kafka:
-    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    # Los 3 brokers de infra/kafka/compose.yml (con uno basta para descubrir el cluster).
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092,localhost:9093,localhost:9094}
+    client-id: ms-andesstay-audit
+    admin:
+      modify-topic-configs: true
     consumer:
+      # Grupo por defecto; cada @KafkaListener indica el suyo (andesstay.kafka.consumer-groups).
       group-id: ms-andesstay-audit
+      # Un grupo nuevo parte desde el inicio del topico: no se pierde ningun evento retenido.
       auto-offset-reset: earliest
+      # El offset lo confirma el contenedor despues de procesar cada registro (ack-mode record),
+      # nunca antes: si el servicio se cae a mitad de camino, el evento se vuelve a entregar.
       enable-auto-commit: false
+      isolation-level: read_committed
+      max-poll-records: 50
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # ErrorHandlingDeserializer envuelve al deserializador JSON: un mensaje que no es JSON
+      # valido no tumba el consumidor, llega al error handler y se envia al DLT.
       value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       properties:
         # Spring Boot 4 usa Jackson 3 por defecto: JacksonJsonDeserializer/Serializer son
@@ -35,13 +47,30 @@ spring:
         spring.json.trusted.packages: com.andesstay.ms_andesstay_audit.messaging
         spring.json.value.default.type: com.andesstay.ms_andesstay_audit.messaging.ReservationEvent
         spring.json.use.type.headers: false
+        # Rebalanceo incremental: al entrar o salir una instancia del grupo solo se mueven las
+        # particiones necesarias, el resto sigue consumiendo sin pausa.
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+        session.timeout.ms: 45000
+        heartbeat.interval.ms: 3000
+        # Cota del procesamiento de un poll (50 registros con sus reintentos) antes de que el
+        # broker considere muerto al consumidor y rebalancee.
+        max.poll.interval.ms: 300000
     producer:
+      # Productor de audit.timeline y del DLT: mismas garantias que el de reservations.
+      acks: all
+      compression-type: lz4
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
       properties:
+        enable.idempotence: true
+        linger.ms: 5
+        delivery.timeout.ms: 30000
+        request.timeout.ms: 10000
         spring.json.add.type.headers: false
     listener:
       ack-mode: record
+      # No falla el arranque si un topico todavia no existe (lo crea su servicio duenio).
+      missing-topics-fatal: false
 
 server:
   port: ${SERVER_PORT:8084}
@@ -51,12 +80,53 @@ andesstay:
     audience: ${AZURE_API_AUDIENCE:api://d6959b0c-9ec2-432e-bddb-54bd0e83ace9}
     roles-claim: roles
   kafka:
-    topic-reservations-events: reservations.events
-    topic-audit-timeline: audit.timeline
-    partitions: 3
-    # 3 replicas es lo que pide el caso para el cluster de EC2 (seccion 9); en un Kafka
-    # de un solo broker en local esto debe bajarse a 1 via esta misma variable.
-    replication-factor: ${KAFKA_TOPIC_REPLICATION_FACTOR:1}
+    # Mismos valores que infra/kafka/scripts/create-topics.sh. replicas: 3 en el cluster de 3
+    # brokers; KAFKA_TOPIC_REPLICATION_FACTOR=1 para un Kafka de un solo broker.
+    topics:
+      # Consumido; lo declara ms-andesstay-reservations.
+      reservations-events: reservations.events
+      reservations-events-dlt:
+        name: reservations.events.DLT
+        # Bajo volumen: 1 particion conserva el orden de llegada para investigar.
+        partitions: 1
+        replicas: ${KAFKA_TOPIC_REPLICATION_FACTOR:3}
+        configs:
+          "[cleanup.policy]": delete
+          # 14 dias: mas que el topico de origen, para dar tiempo a revisar y reprocesar.
+          "[retention.ms]": 1209600000
+          "[min.insync.replicas]": ${KAFKA_MIN_INSYNC_REPLICAS:2}
+      audit-timeline:
+        name: audit.timeline
+        partitions: 3
+        replicas: ${KAFKA_TOPIC_REPLICATION_FACTOR:3}
+        configs:
+          # Compactado por reservationId: Kafka conserva el ultimo registro de cada reserva, y
+          # un consumidor nuevo reconstruye el estado actual sin leer todo el historial (el
+          # historial completo ya queda en la tabla AUDIT_EVENTS).
+          "[cleanup.policy]": compact
+          # Segmentos de 1 hora para que la compactacion corra seguido.
+          "[segment.ms]": 3600000
+          # Un registro recien escrito no se compacta antes de 1 minuto.
+          "[min.compaction.lag.ms]": 60000
+          # Las tombstones (valor null) se conservan 1 dia antes de borrarse.
+          "[delete.retention.ms]": 86400000
+          "[min.cleanable.dirty.ratio]": 0.1
+          "[min.insync.replicas]": ${KAFKA_MIN_INSYNC_REPLICAS:2}
+    consumer-groups:
+      # audit y report usan grupos distintos: cada uno recibe TODOS los eventos (pub/sub).
+      # Dentro de un grupo las particiones se reparten entre sus consumidores (balanceo).
+      reservations-events: ms-andesstay-audit
+      # Grupo aparte para el monitor del DLT: no compite con el procesamiento normal.
+      dlt-monitor: ms-andesstay-audit-dlt-monitor
+    consumer:
+      # 3 hilos = 1 por particion de reservations.events.
+      concurrency: 3
+      # 1 intento + 3 reintentos (1 s, 2 s, 4 s) y luego al DLT.
+      retry:
+        max-retries: 3
+        initial-interval-ms: 1000
+        multiplier: 2.0
+        max-interval-ms: 10000
 
 management:
   endpoints:
